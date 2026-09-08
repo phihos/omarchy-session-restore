@@ -1,0 +1,16 @@
+# Tooling config only. The plugin itself is a single script plus a QML service;
+# it is installed by cloning this repo, never by pip, so there is no build
+# system or package metadata here.
+
+[tool.ruff]
+line-length = 100
+# The engine is `hypr-session`, with no .py extension, because it is also the
+# user-facing CLI. Ruff skips extensionless files when walking a directory, so
+# name it explicitly.
+extend-include = ["hypr-session"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

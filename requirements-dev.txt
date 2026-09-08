@@ -1,0 +1,6 @@
+# Development tooling only — the plugin itself needs nothing but Python 3.
+# Pinned so a new lint release cannot turn CI red on an untouched branch;
+# Dependabot proposes the bumps.
+pytest==9.1.1
+ruff==0.16.6
+shellcheck-py==0.11.0.1
