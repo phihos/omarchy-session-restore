@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # A tag is not a shortcut past the checks: the same CI that guards main
+  # guards a release, and a red run means no release exists to install.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: release
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # release notes are generated from the history
+
+      - name: Check the tag against manifest.json
+        run: |
+          version=$(jq -r .version manifest.json)
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ $version != "$tag" ]]; then
+            echo "::error file=manifest.json::tag $GITHUB_REF_NAME says $tag" \
+                 "but manifest.json says $version"
+            echo "The version the plugin reports to Omarchy must match the tag" \
+                 "users install, so this release is refused." >&2
+            exit 1
+          fi
+          echo "manifest.json and $GITHUB_REF_NAME both say $version"
+
+      - name: Take the release notes from the changelog
+        id: notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if .github/scripts/changelog-section.sh "$version" > notes.md; then
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no changelog section for $version; falling back to generated notes"
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--title "${GITHUB_REF_NAME#v}" --generate-notes)
+          if [[ "${{ steps.notes.outputs.have_notes }}" == true ]]; then
+            args+=(--notes-file notes.md)
+          fi
+          gh release create "$GITHUB_REF_NAME" "${args[@]}"

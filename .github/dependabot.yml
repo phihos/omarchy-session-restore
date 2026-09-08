@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Actions are pinned to a major version, so this speaks up only when a new
+  # major lands and the pin needs a human to look at it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+  # The lint and test tools are pinned exactly, so that a new ruff release
+  # cannot turn an untouched branch red. This is what un-pins them on purpose.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

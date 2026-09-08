@@ -1,5 +1,7 @@
 # Session Restore — an Omarchy shell plugin
 
+[![CI](https://github.com/phihos/omarchy-session-restore/actions/workflows/ci.yml/badge.svg)](https://github.com/phihos/omarchy-session-restore/actions/workflows/ci.yml)
+
 Reopens the apps you had open, on the workspaces you had them on, after a
 reboot. Neither Omarchy nor Hyprland ships this: Hyprland
 [declined session restore as out of scope](https://github.com/hyprwm/Hyprland/issues/2475),
@@ -10,7 +12,7 @@ extension points.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-session-restore.git --enable
+omarchy plugin add https://github.com/phihos/omarchy-session-restore.git --enable
 ```
 
 The plugin runs as a shell `service` (no bar widget). It snapshots your layout
@@ -89,6 +91,29 @@ exists). Python 3, no third-party modules.
 
 ⚠️ Plugins run as unsandboxed code inside your long-lived `omarchy-shell`
 process. Read the source before enabling this or any other plugin.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt      # pytest, ruff, shellcheck
+pytest -q                                # the engine's pure logic
+ruff check                               # lint
+shellcheck .github/scripts/*.sh          # lint the CI scripts
+.github/scripts/validate-manifest.sh .   # the manifest checks the shell enforces
+```
+
+The tests cover the parts that run without a compositor — rebuilding a relaunch
+command, recovering a web app's URL, deciding what counts as a layout change.
+CI runs all of it on every push, and the tests across Python 3.11 through 3.14.
+
+Releases are tag-driven: bump `version` in `manifest.json`, add the section to
+[`CHANGELOG.md`](CHANGELOG.md), then push a `vX.Y.Z` tag. The release workflow
+re-runs CI, refuses to publish if the tag and the manifest disagree about the
+version, and takes the release notes from the changelog.
+
+Note that `omarchy plugin update` fast-forwards to the default branch rather
+than to the newest tag, so `main` is what installed copies actually track. Tags
+and releases are the human-readable record of what changed when.
 
 ## Prior art
 

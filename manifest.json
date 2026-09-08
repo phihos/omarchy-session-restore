@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "phil.session",
   "name": "Session Restore",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "author": "Philipp Hossner",
   "description": "Snapshots open windows and their workspaces, and restores them on login.",
   "kinds": [
@@ -11,5 +11,6 @@
   "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml"
-  }
+  },
+  "homepage": "https://github.com/phihos/omarchy-session-restore"
 }
