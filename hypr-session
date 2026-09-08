@@ -13,6 +13,7 @@ Skip rules live in ~/.config/omarchy/session-skip.txt (one window class per line
 import json
 import os
 import re
+import fcntl
 import shlex
 import subprocess
 import sys
@@ -20,12 +21,27 @@ import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy")
 STATE_FILE = os.path.join(STATE_DIR, "session.json")
-LOCK_FILE = os.path.join(STATE_DIR, "session.restoring")
+LOCK_FILE = os.path.join(STATE_DIR, "session.lock")
+LOG_FILE = os.path.join(STATE_DIR, "session-restore.log")
 BOOT_MARKER = os.path.join(STATE_DIR, "session.restored-boot")
 SKIP_FILE = os.path.expanduser("~/.config/omarchy/session-skip.txt")
 
 # Windows owned by the desktop itself, which must never be relaunched.
-ALWAYS_SKIP = {"", "omarchy-shell", "quickshell", "hyprlock", "xdg-desktop-portal-hyprland"}
+ALWAYS_SKIP = {
+    "", "omarchy-shell", "quickshell", "hyprlock", "xdg-desktop-portal-hyprland",
+    "walker",  # the launcher: transient, and relaunching it on login is noise
+}
+
+# Terminals get their directory from the shell running inside them, not from
+# their own argv: argv only says where the terminal was *opened*, so a cd during
+# the session would be lost.
+TERMINAL_CLASSES = {
+    "alacritty", "kitty", "foot", "footclient", "ghostty",
+    "com.mitchellh.ghostty", "org.wezfurlong.wezterm", "wezterm",
+}
+
+# Directory flags to drop when a live cwd replaces them, in both spellings.
+CWD_FLAGS = ("--working-directory", "--working-dir", "--directory", "--cwd", "-d")
 
 LAUNCH_STAGGER_S = 0.4    # between launches, so rules are not queued on top of each other
 PLACEMENT_TIMEOUT_S = 45  # how long to keep watching for slow apps to map
@@ -34,6 +50,39 @@ SETTLE_S = 1.5          # focus_on_activate means apps grab focus as they finish
 
 
 # --- hyprland plumbing -------------------------------------------------------
+
+def log(message):
+    """Append one line to the session log.
+
+    The restore runs unattended at login with no terminal attached, so this is
+    the only way to find out afterwards what it did or why it did nothing.
+    """
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 256_000:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}\n")
+    except OSError:
+        pass
+
+
+def take_lock():
+    """Exclusive lock shared by save and restore, or None if already held.
+
+    An advisory lock rather than a lock file that gets created and deleted: the
+    kernel drops it when the process dies, so a restore killed halfway cannot
+    leave a stale lock behind that silently stops every future save.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
 
 def hyprctl_json(*args):
     out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True)
@@ -97,6 +146,39 @@ DESKTOP_DIRS = [
     os.path.expanduser("~/.nix-profile/share/applications"),
     "/usr/share/applications",
 ]
+
+
+def shell_cwd(pid):
+    """Where the shell inside a terminal actually is now."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            children = f.read().split()
+    except OSError:
+        return ""
+    for child in reversed(children):  # the newest child is the live shell
+        try:
+            target = os.readlink(f"/proc/{child}/cwd")
+        except OSError:
+            continue
+        if os.path.isdir(target):
+            return target
+    return ""
+
+
+def strip_cwd_flags(argv):
+    """Drop a terminal's directory flags so a recorded live cwd wins."""
+    out, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if any(arg == f for f in CWD_FLAGS):
+            skip = True   # flag and its value are separate tokens
+            continue
+        if any(arg.startswith(f + "=") for f in CWD_FLAGS):
+            continue
+        out.append(arg)
+    return out
 
 
 def class_for_url(url):
@@ -229,9 +311,12 @@ def collect():
         # Special workspaces are addressed by name, normal ones by number.
         target = f"special:{ws_name.split(':', 1)[-1]}" if ws_id < 0 else str(ws_id)
 
+        cwd = shell_cwd(c.get("pid", -1)) if cls.lower() in TERMINAL_CLASSES else ""
+
         seen.add(key)
         entries.append({
             "class": cls,
+            "cwd": cwd,
             "title": c.get("title", ""),
             "workspace": target,
             "workspace_id": ws_id,
@@ -247,10 +332,14 @@ def collect():
 
 
 def cmd_save():
-    if os.path.exists(LOCK_FILE):
+    lock = take_lock()
+    if lock is None:
         return 0  # a restore is in flight; the layout has not settled yet
 
-    entries = collect()
+    try:
+        entries = collect()
+    finally:
+        lock.close()
     if not entries:
         return 0  # never overwrite a good snapshot with an empty one
 
@@ -260,6 +349,7 @@ def cmd_save():
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, STATE_FILE)  # atomic: a crash mid-write cannot corrupt the snapshot
+    log(f"save: {len(entries)} window(s)")
     return 0
 
 
@@ -274,6 +364,13 @@ def launch(entry):
             rules += ["float", f"size {w} {h}", f"move {x} {y}"]
 
     argv = entry["command"]
+    cwd = entry.get("cwd") or ""
+    if cwd:
+        # Replace whatever directory the terminal was originally opened with,
+        # then cd before exec so the shell starts where it actually was.
+        argv = strip_cwd_flags(argv)
+        inner = " ".join(shlex.quote(a) for a in argv)
+        argv = ["sh", "-c", f"cd {shlex.quote(cwd)} && exec {inner}"]
     cmd = " ".join(shlex.quote(a) for a in argv)
     # Omarchy's own launchers already exec through uwsm-app; wrapping them
     # again would nest the systemd scopes.
@@ -327,9 +424,12 @@ def cmd_restore(if_empty=False):
     if not windows:
         return 0
 
-    os.makedirs(STATE_DIR, exist_ok=True)
-    open(LOCK_FILE, "w").close()
+    lock = take_lock()
+    if lock is None:
+        log("restore: skipped, another restore is already running")
+        return 0
     home_workspace = active_workspace()
+    log(f"restore: starting, {len(windows)} window(s), returning to workspace {home_workspace}")
 
     try:
         before = {c["address"] for c in hyprctl_json("clients")}
@@ -360,12 +460,14 @@ def cmd_restore(if_empty=False):
                 claimed.add(addr)
                 pending.remove(entry)
                 place(c, entry)
+                log(f"restore: placed {cls} on workspace {entry['workspace']}")
             if pending:
                 time.sleep(POLL_INTERVAL_S)
 
         if pending:
             missed = ", ".join(sorted({e["class"] for e in pending}))
             print(f"did not see windows for: {missed}", file=sys.stderr)
+            log(f"restore: no window appeared for {missed}")
     finally:
         # Placement dispatchers pull focus, and Omarchy runs with
         # misc:focus_on_activate = true, so apps like Chromium yank the
@@ -374,8 +476,8 @@ def cmd_restore(if_empty=False):
         for _ in range(3):
             time.sleep(SETTLE_S)
             dispatch(f"hl.dsp.workspace({home_workspace})")
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        log("restore: completed")
+        lock.close()  # the kernel would drop it anyway if we died here
 
     with open(BOOT_MARKER, "w") as f:
         f.write(boot_id())
@@ -391,7 +493,8 @@ def cmd_show():
     print(f"saved {time.ctime(saved['saved_at'])} — {len(saved['windows'])} windows")
     for e in saved["windows"]:
         geo = " (floating)" if e["floating"] else ""
-        print(f"  ws {e['workspace']:<12} {e['class']:<34}{geo}  {' '.join(e['command'])}")
+        cwd = f"  [cwd {e['cwd']}]" if e.get("cwd") else ""
+        print(f"  ws {e['workspace']:<12} {e['class']:<34}{geo}  {' '.join(e['command'])}{cwd}")
     return 0
 
 

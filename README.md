@@ -34,8 +34,12 @@ It is meant to be invisible, but the engine is a normal CLI:
 ## How it works
 
 **Snapshot.** Each window's relaunch command comes from `/proc/<pid>/cmdline`,
-so arguments survive — a terminal comes back in the directory it was opened in.
-Most session tools keep a hand-maintained class→binary map and lose that.
+so arguments survive. Most session tools keep a hand-maintained class→binary map
+and lose that.
+
+Terminals get their directory from the shell running inside them rather than
+from their own argv, because argv only records where the terminal was *opened* —
+`cd` somewhere during the day and argv is stale.
 
 Chromium is the exception: every web app and browser window shares one process,
 so a window's cmdline names whichever app started that process, and keying on
@@ -67,6 +71,8 @@ finish loading; the restore re-asserts your original workspace afterwards.
 - Browsers are relaunched once via `omarchy-launch-browser` and restore their
   own windows and tabs.
 - A slow starter may flash briefly on the current workspace before it is moved.
+- What the restore did is logged to `~/.local/state/omarchy/session-restore.log`,
+  since it runs unattended at login with no terminal to print to.
 - `omarchy restart shell` will not duplicate your windows: the restore is a
   no-op unless the session is empty and nothing has been restored this boot.
 - Plugin ids in Omarchy are author-scoped. Fork and change `id` in
@@ -80,6 +86,21 @@ exists). Python 3, no third-party modules.
 
 ⚠️ Plugins run as unsandboxed code inside your long-lived `omarchy-shell`
 process. Read the source before enabling this or any other plugin.
+
+## Prior art
+
+[`wbarakat/omarchy-session-restore`](https://github.com/wbarakat/omarchy-session-restore)
+arrived at the same core idea independently and earlier: rebuild launch commands
+from `/proc/<pid>/cmdline`, restore at shell startup, place windows silently.
+Worth using if it fits you.
+
+This one differs in handling Chromium web apps — which that plugin documents as
+a known limitation ("windows sharing one process collapse to a single relaunch
+entry") and which is most of a browser-heavy work session — and in snapshotting
+periodically rather than on the way to a reboot. Reading its source also
+improved this one: capturing the terminal's live working directory, and using an
+advisory lock the kernel releases on death rather than a lock file a crash can
+leave behind.
 
 ## License
 
