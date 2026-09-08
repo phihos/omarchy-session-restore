@@ -1,0 +1,4 @@
+# Copy to ~/.config/omarchy/session-skip.txt
+# Window classes that must never be snapshotted or relaunched, one per line.
+# Find a window's class with: hyprctl clients -j | grep class
+# Desktop-owned windows (omarchy-shell, hyprlock, ...) are skipped automatically.

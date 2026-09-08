@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "phil.session",
+  "name": "Session Restore",
+  "version": "1.0.0",
+  "author": "Philipp Hossner",
+  "description": "Snapshots open windows and their workspaces, and restores them on login.",
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Snapshot and restore the Hyprland window session (apps + workspace placement).
+
+  hypr-session save                 write the current layout to the state file
+  hypr-session restore              relaunch the saved layout
+  hypr-session restore --if-empty   restore only when nothing is open yet
+  hypr-session show                 print the saved layout
+
+State lives in ~/.local/state/omarchy/session.json.
+Skip rules live in ~/.config/omarchy/session-skip.txt (one window class per line).
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/omarchy")
+STATE_FILE = os.path.join(STATE_DIR, "session.json")
+LOCK_FILE = os.path.join(STATE_DIR, "session.restoring")
+BOOT_MARKER = os.path.join(STATE_DIR, "session.restored-boot")
+SKIP_FILE = os.path.expanduser("~/.config/omarchy/session-skip.txt")
+
+# Windows owned by the desktop itself, which must never be relaunched.
+ALWAYS_SKIP = {"", "omarchy-shell", "quickshell", "hyprlock", "xdg-desktop-portal-hyprland"}
+
+LAUNCH_STAGGER_S = 0.4    # between launches, so rules are not queued on top of each other
+PLACEMENT_TIMEOUT_S = 45  # how long to keep watching for slow apps to map
+POLL_INTERVAL_S = 0.5
+SETTLE_S = 1.5          # focus_on_activate means apps grab focus as they finish loading
+
+
+# --- hyprland plumbing -------------------------------------------------------
+
+def hyprctl_json(*args):
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(f"hyprctl {' '.join(args)} failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def lua_string(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def dispatch(expr):
+    return subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True)
+
+
+def active_workspace():
+    return hyprctl_json("activeworkspace").get("id", 1)
+
+
+def boot_id():
+    with open("/proc/sys/kernel/random/boot_id") as f:
+        return f.read().strip()
+
+
+# --- snapshot ----------------------------------------------------------------
+
+def skip_classes():
+    classes = set(ALWAYS_SKIP)
+    if os.path.exists(SKIP_FILE):
+        with open(SKIP_FILE) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    classes.add(line)
+    return classes
+
+
+def cmdline_for(pid):
+    """The argv the window's process was started with, as a token list."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    argv = [a for a in raw.decode("utf-8", "replace").split("\0") if a]
+    return argv or None
+
+
+WEBAPP_CLASS_RE = re.compile(r"^chrome-(.+)-Default$")
+
+# A browser's own windows: the browser restores its tabs itself, so relaunch it
+# once rather than trying to reconstruct each window.
+BROWSER_CLASSES = {
+    "chromium", "google-chrome", "google-chrome-stable", "brave-browser",
+    "microsoft-edge", "vivaldi-stable", "helium", "firefox", "zen",
+}
+
+DESKTOP_DIRS = [
+    os.path.expanduser("~/.local/share/applications"),
+    os.path.expanduser("~/.nix-profile/share/applications"),
+    "/usr/share/applications",
+]
+
+
+def class_for_url(url):
+    """The window class Chromium derives for `--app=<url>`."""
+    match = re.match(r"https?://([^/]+)(/.*)?$", url)
+    if not match:
+        return None
+    host, path = match.group(1), match.group(2) or ""
+    return f"chrome-{host}__{path.strip('/').replace('/', '_')}-Default"
+
+
+def webapp_launchers():
+    """Exact web app URLs from installed .desktop launchers, keyed by window class.
+
+    Decoding a URL back out of the class is lossy (Chromium flattens '/' to '_',
+    so a path that contains '_' cannot be told apart from one that contains '/').
+    The launcher that created the web app holds the authoritative URL, so prefer
+    it and keep the decode as a fallback.
+    """
+    found = {}
+    for directory in DESKTOP_DIRS:
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in sorted(names):
+            if not name.endswith(".desktop"):
+                continue
+            try:
+                text = open(os.path.join(directory, name), errors="replace").read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if not line.startswith("Exec=") or "omarchy-launch-webapp" not in line:
+                    continue
+                try:
+                    tokens = shlex.split(line[len("Exec="):])
+                except ValueError:
+                    continue
+                for token in tokens[1:]:
+                    if token.startswith("http"):
+                        key = class_for_url(token)
+                        if key:
+                            found.setdefault(key, token)
+                        break
+    return found
+
+
+def webapp_url(cls, launchers):
+    if cls in launchers:
+        return launchers[cls]
+    host_path = WEBAPP_CLASS_RE.match(cls).group(1)
+    host, _, path = host_path.partition("__")
+    url = "https://" + host
+    if path:
+        url += "/" + path.replace("_", "/")
+    return url
+
+
+def resolve(client, launchers):
+    """(dedup key, relaunch command) for one window, or None to skip it.
+
+    Chromium runs every web app and browser window in one process, so a window's
+    /proc cmdline is whichever app happened to start that process -- it names the
+    wrong app for every window but the first, and keying on the pid would drop
+    all the rest. Identify those by window class instead.
+    """
+    cls = client.get("class") or client.get("initialClass") or ""
+
+    if WEBAPP_CLASS_RE.match(cls):
+        return f"class:{cls}", ["omarchy-launch-webapp", webapp_url(cls, launchers)]
+
+    if cls.lower() in BROWSER_CLASSES:
+        return f"class:{cls}", ["omarchy-launch-browser"]
+
+    pid = client.get("pid", -1)
+    if pid <= 0:
+        return None
+    argv = cmdline_for(pid)
+    if not argv:
+        return None
+    return f"pid:{pid}", normalize(argv)
+
+
+def normalize(argv):
+    """Turn a live argv into a stable relaunch command.
+
+    Chromium and most Electron apps rewrite their own cmdline into a single
+    space-joined blob for the process title, so argv is not reliably split and
+    a per-token check would miss the flags entirely. Search the joined string.
+
+    Web apps carry a long flag list plus an --app= URL; Omarchy has a launcher
+    for exactly that shape, so collapse them back down to it.
+    """
+    joined = " ".join(argv)
+    match = re.search(r"--app=(\S+)", joined)
+    if match:
+        return ["omarchy-launch-webapp", match.group(1).strip("\"'")]
+    if len(argv) == 1 and " " in argv[0]:
+        return shlex.split(argv[0])
+    return argv
+
+
+def collect():
+    clients = hyprctl_json("clients")
+    skip = skip_classes()
+    launchers = webapp_launchers()
+    seen = set()
+    entries = []
+
+    for c in clients:
+        if not c.get("mapped", True):
+            continue
+        cls = c.get("class") or c.get("initialClass") or ""
+        if cls in skip:
+            continue
+
+        resolved = resolve(c, launchers)
+        if resolved is None:
+            continue
+        key, command = resolved
+        if key in seen:
+            continue  # already covered: extra windows are the app's own doing
+
+        ws = c.get("workspace") or {}
+        ws_id = ws.get("id")
+        if ws_id is None:
+            continue
+        ws_name = ws.get("name") or ""
+        # Special workspaces are addressed by name, normal ones by number.
+        target = f"special:{ws_name.split(':', 1)[-1]}" if ws_id < 0 else str(ws_id)
+
+        seen.add(key)
+        entries.append({
+            "class": cls,
+            "title": c.get("title", ""),
+            "workspace": target,
+            "workspace_id": ws_id,
+            "floating": bool(c.get("floating")),
+            "at": c.get("at") or [0, 0],
+            "size": c.get("size") or [0, 0],
+            "command": command,
+        })
+
+    # Deterministic order so the tiling layout reproduces the same splits.
+    entries.sort(key=lambda e: (e["workspace_id"] < 0, e["workspace_id"], e["at"][0], e["at"][1]))
+    return entries
+
+
+def cmd_save():
+    if os.path.exists(LOCK_FILE):
+        return 0  # a restore is in flight; the layout has not settled yet
+
+    entries = collect()
+    if not entries:
+        return 0  # never overwrite a good snapshot with an empty one
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    payload = {"version": 1, "saved_at": int(time.time()), "windows": entries}
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, STATE_FILE)  # atomic: a crash mid-write cannot corrupt the snapshot
+    return 0
+
+
+# --- restore -----------------------------------------------------------------
+
+def launch(entry):
+    rules = [f"workspace {entry['workspace']} silent"]
+    if entry.get("floating"):
+        w, h = entry.get("size", [0, 0])
+        x, y = entry.get("at", [0, 0])
+        if w > 0 and h > 0:
+            rules += ["float", f"size {w} {h}", f"move {x} {y}"]
+
+    argv = entry["command"]
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    # Omarchy's own launchers already exec through uwsm-app; wrapping them
+    # again would nest the systemd scopes.
+    if argv[0].startswith("omarchy-launch") or argv[0] == "uwsm-app":
+        full = f"[{';'.join(rules)}] {cmd}"
+    else:
+        full = f"[{';'.join(rules)}] uwsm-app -- {cmd}"
+    dispatch(f"hl.dsp.exec_cmd({lua_string(full)})")
+
+
+def place(client, entry):
+    """Force a mapped window to the snapshot's workspace and geometry."""
+    addr = f"address:{client['address']}"
+    ws = client.get("workspace", {})
+
+    if str(ws.get("id")) != entry["workspace"] and ws.get("name") != entry["workspace"]:
+        dispatch(f'hl.dsp.window.move({{workspace={lua_string(entry["workspace"])}, '
+                 f'window={lua_string(addr)}, silent=true}})')
+
+    if entry.get("floating"):
+        w, h = entry.get("size", [0, 0])
+        x, y = entry.get("at", [0, 0])
+        if not client.get("floating"):
+            dispatch(f'hl.dsp.window.float({{window={lua_string(addr)}}})')
+        if w > 0 and h > 0:
+            dispatch(f'hl.dsp.window.resize({{x={w}, y={h}, window={lua_string(addr)}, exact=true}})')
+            dispatch(f'hl.dsp.window.move({{x={x}, y={y}, window={lua_string(addr)}, exact=true}})')
+
+
+def cmd_restore(if_empty=False):
+    if not os.path.exists(STATE_FILE):
+        print("no saved session", file=sys.stderr)
+        return 1
+
+    skip = skip_classes()
+
+    if if_empty:
+        marker = None
+        if os.path.exists(BOOT_MARKER):
+            with open(BOOT_MARKER) as f:
+                marker = f.read().strip()
+        if marker == boot_id():
+            return 0  # already restored since this boot
+        live = [c for c in hyprctl_json("clients")
+                if (c.get("class") or "") not in skip and c.get("mapped", True)]
+        if live:
+            return 0  # a real session is already up; do not duplicate it
+
+    with open(STATE_FILE) as f:
+        windows = json.load(f).get("windows", [])
+    if not windows:
+        return 0
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    open(LOCK_FILE, "w").close()
+    home_workspace = active_workspace()
+
+    try:
+        before = {c["address"] for c in hyprctl_json("clients")}
+
+        for entry in windows:
+            launch(entry)
+            time.sleep(LAUNCH_STAGGER_S)
+
+        # Hyprland's [workspace N silent] exec rule is a timing heuristic --
+        # Omarchy ships misc:initial_workspace_tracking = 0 so that apps open
+        # on the current workspace. A slow starter (Chromium, Electron) can map
+        # after the rule has expired and land wherever you happen to be, and
+        # omarchy-launch-webapp's setsid hides it from the rule entirely.
+        # So watch for each window to appear and place it explicitly.
+        pending = list(windows)
+        claimed = set()
+        deadline = time.time() + PLACEMENT_TIMEOUT_S
+
+        while pending and time.time() < deadline:
+            for c in hyprctl_json("clients"):
+                addr = c["address"]
+                if addr in before or addr in claimed or not c.get("mapped", True):
+                    continue
+                cls = c.get("class") or ""
+                entry = next((e for e in pending if e["class"] == cls), None)
+                if entry is None:
+                    continue  # a window we did not ask for; leave it alone
+                claimed.add(addr)
+                pending.remove(entry)
+                place(c, entry)
+            if pending:
+                time.sleep(POLL_INTERVAL_S)
+
+        if pending:
+            missed = ", ".join(sorted({e["class"] for e in pending}))
+            print(f"did not see windows for: {missed}", file=sys.stderr)
+    finally:
+        # Placement dispatchers pull focus, and Omarchy runs with
+        # misc:focus_on_activate = true, so apps like Chromium yank the
+        # workspace to themselves as they finish loading. Let those late
+        # activation requests land before taking focus back, then hold it.
+        for _ in range(3):
+            time.sleep(SETTLE_S)
+            dispatch(f"hl.dsp.workspace({home_workspace})")
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+
+    with open(BOOT_MARKER, "w") as f:
+        f.write(boot_id())
+    return 0
+
+
+def cmd_show():
+    if not os.path.exists(STATE_FILE):
+        print("no saved session", file=sys.stderr)
+        return 1
+    with open(STATE_FILE) as f:
+        saved = json.load(f)
+    print(f"saved {time.ctime(saved['saved_at'])} — {len(saved['windows'])} windows")
+    for e in saved["windows"]:
+        geo = " (floating)" if e["floating"] else ""
+        print(f"  ws {e['workspace']:<12} {e['class']:<34}{geo}  {' '.join(e['command'])}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 1
+    action = args[0]
+    if action == "save":
+        return cmd_save()
+    if action == "restore":
+        return cmd_restore(if_empty="--if-empty" in args)
+    if action == "show":
+        return cmd_show()
+    print(f"unknown action: {action}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
