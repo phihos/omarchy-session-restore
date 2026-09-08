@@ -72,7 +72,10 @@ finish loading; the restore re-asserts your original workspace afterwards.
   own windows and tabs.
 - A slow starter may flash briefly on the current workspace before it is moved.
 - What the restore did is logged to `~/.local/state/omarchy/session-restore.log`,
-  since it runs unattended at login with no terminal to print to.
+  since it runs unattended at login with no terminal to print to. Saves are
+  logged only when the layout actually changed, so the log stays a record of
+  events rather than a 60-second heartbeat. It rotates once at 256 KB, so it
+  costs at most ~512 KB.
 - `omarchy restart shell` will not duplicate your windows: the restore is a
   no-op unless the session is empty and nothing has been restored this boot.
 - Plugin ids in Omarchy are author-scoped. Fork and change `id` in

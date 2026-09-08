@@ -331,6 +331,24 @@ def collect():
     return entries
 
 
+def layout_signature(entries):
+    """What the log cares about: which apps are where, not their pixel geometry.
+
+    Retiling and resizing change coordinates constantly; they are not events
+    worth a log line.
+    """
+    return [(e["class"], e["workspace"], e["floating"], e.get("cwd", ""), tuple(e["command"]))
+            for e in entries]
+
+
+def previous_entries():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("windows") or []
+    except (OSError, ValueError):
+        return []
+
+
 def cmd_save():
     lock = take_lock()
     if lock is None:
@@ -338,6 +356,7 @@ def cmd_save():
 
     try:
         entries = collect()
+        previous = previous_entries()
     finally:
         lock.close()
     if not entries:
@@ -349,7 +368,12 @@ def cmd_save():
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, STATE_FILE)  # atomic: a crash mid-write cannot corrupt the snapshot
-    log(f"save: {len(entries)} window(s)")
+
+    # Log only when the layout actually changed. A line per 60s tick would push
+    # the restore record off the end of the log within days, and that record is
+    # the whole reason there is a log.
+    if layout_signature(entries) != layout_signature(previous):
+        log(f"save: {len(entries)} window(s)")
     return 0
 
 
