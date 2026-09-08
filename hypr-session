@@ -10,10 +10,10 @@ State lives in ~/.local/state/omarchy/session.json.
 Skip rules live in ~/.config/omarchy/session-skip.txt (one window class per line).
 """
 
+import fcntl
 import json
 import os
 import re
-import fcntl
 import shlex
 import subprocess
 import sys
@@ -75,7 +75,9 @@ def take_lock():
     leave a stale lock behind that silently stops every future save.
     """
     os.makedirs(STATE_DIR, exist_ok=True)
-    handle = open(LOCK_FILE, "w")
+    # Deliberately not a context manager: closing the handle drops the lock,
+    # and the whole point is that it outlives this function.
+    handle = open(LOCK_FILE, "w")  # noqa: SIM115
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -208,7 +210,8 @@ def webapp_launchers():
             if not name.endswith(".desktop"):
                 continue
             try:
-                text = open(os.path.join(directory, name), errors="replace").read()
+                with open(os.path.join(directory, name), errors="replace") as f:
+                    text = f.read()
             except OSError:
                 continue
             for line in text.splitlines():
@@ -420,7 +423,8 @@ def place(client, entry):
         if not client.get("floating"):
             dispatch(f'hl.dsp.window.float({{window={lua_string(addr)}}})')
         if w > 0 and h > 0:
-            dispatch(f'hl.dsp.window.resize({{x={w}, y={h}, window={lua_string(addr)}, exact=true}})')
+            dispatch(f'hl.dsp.window.resize({{x={w}, y={h}, '
+                     f'window={lua_string(addr)}, exact=true}})')
             dispatch(f'hl.dsp.window.move({{x={x}, y={y}, window={lua_string(addr)}, exact=true}})')
 
 
