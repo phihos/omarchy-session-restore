@@ -98,11 +98,49 @@ def lua_string(s):
 
 
 def dispatch(expr):
-    return subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True)
+    """Run one Lua dispatcher, and say so in the log when it does not take.
+
+    hyprctl answers a bad dispatcher with a non-zero status *and* an "error:"
+    line on stdout, and for a long time this function returned that quietly to
+    a caller that never looked. A dispatcher that silently does nothing is the
+    worst kind of bug in a restore: every window ends up somewhere plausible
+    and the log still says it finished.
+    """
+    out = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True)
+    if out.returncode != 0 or out.stdout.strip().startswith("error"):
+        detail = (out.stdout.strip() or out.stderr.strip()).splitlines()[:1]
+        log(f"dispatch failed: {expr} -> {detail[0] if detail else 'no output'}")
+    return out
+
+
+def workspace_target(ws):
+    """How a window's workspace is recorded, or None if it has none.
+
+    Normal workspaces go by number. Special workspaces -- Omarchy's Meta+S
+    scratchpad is one -- go by name, because their ids are negative and
+    assigned in the order they happen to be created, so they mean nothing
+    across a reboot.
+    """
+    ws_id = ws.get("id")
+    if ws_id is None:
+        return None
+    if ws_id < 0:
+        return f"special:{(ws.get('name') or '').split(':', 1)[-1]}"
+    return str(ws_id)
 
 
 def active_workspace():
-    return hyprctl_json("activeworkspace").get("id", 1)
+    return workspace_target(hyprctl_json("activeworkspace")) or "1"
+
+
+def shown_specials():
+    """Special workspaces currently pulled up, by name, per the monitors."""
+    names = set()
+    for monitor in hyprctl_json("monitors"):
+        name = (monitor.get("specialWorkspace") or {}).get("name") or ""
+        if name:
+            names.add(name)
+    return names
 
 
 def boot_id():
@@ -308,11 +346,9 @@ def collect():
 
         ws = c.get("workspace") or {}
         ws_id = ws.get("id")
-        if ws_id is None:
+        target = workspace_target(ws)
+        if target is None:
             continue
-        ws_name = ws.get("name") or ""
-        # Special workspaces are addressed by name, normal ones by number.
-        target = f"special:{ws_name.split(':', 1)[-1]}" if ws_id < 0 else str(ws_id)
 
         cwd = shell_cwd(c.get("pid", -1)) if cls.lower() in TERMINAL_CLASSES else ""
 
@@ -408,12 +444,34 @@ def launch(entry):
     dispatch(f"hl.dsp.exec_cmd({lua_string(full)})")
 
 
+def match_entry(pending, cls, workspace):
+    """Which pending entry a window that just mapped belongs to, or None.
+
+    Class is all Hyprland gives us to go on: a window carries no trace of the
+    exec that produced it. That is ambiguous when one class was launched more
+    than once -- a terminal on a workspace and a second one in the scratchpad --
+    so prefer the entry that wants the workspace the window actually reached.
+    The exec rule usually did land it correctly, and believing it keeps two
+    same-class windows from claiming each other's place.
+
+    Failing that, fall back to the oldest pending entry, which is the earliest
+    launched: entries are launched in the order they are held here.
+    """
+    candidates = [e for e in pending if e["class"] == cls]
+    if not candidates:
+        return None
+    for entry in candidates:
+        if entry["workspace"] == workspace:
+            return entry
+    return candidates[0]
+
+
 def place(client, entry):
     """Force a mapped window to the snapshot's workspace and geometry."""
     addr = f"address:{client['address']}"
     ws = client.get("workspace", {})
 
-    if str(ws.get("id")) != entry["workspace"] and ws.get("name") != entry["workspace"]:
+    if workspace_target(ws) != entry["workspace"]:
         dispatch(f'hl.dsp.window.move({{workspace={lua_string(entry["workspace"])}, '
                  f'window={lua_string(addr)}, silent=true}})')
 
@@ -457,6 +515,9 @@ def cmd_restore(if_empty=False):
         log("restore: skipped, another restore is already running")
         return 0
     home_workspace = active_workspace()
+    # Whatever scratchpad you had pulled up before the restore stays pulled up;
+    # anything the restore reveals by itself gets put away again at the end.
+    specials_before = shown_specials()
     log(f"restore: starting, {len(windows)} window(s), returning to workspace {home_workspace}")
 
     try:
@@ -482,7 +543,7 @@ def cmd_restore(if_empty=False):
                 if addr in before or addr in claimed or not c.get("mapped", True):
                     continue
                 cls = c.get("class") or ""
-                entry = next((e for e in pending if e["class"] == cls), None)
+                entry = match_entry(pending, cls, workspace_target(c.get("workspace") or {}))
                 if entry is None:
                     continue  # a window we did not ask for; leave it alone
                 claimed.add(addr)
@@ -503,7 +564,20 @@ def cmd_restore(if_empty=False):
         # activation requests land before taking focus back, then hold it.
         for _ in range(3):
             time.sleep(SETTLE_S)
-            dispatch(f"hl.dsp.workspace({home_workspace})")
+            # hl.dsp.workspace is a namespace table, not a dispatcher: calling
+            # it errors out, and the focus never came back. Switching workspace
+            # is hl.dsp.focus.
+            dispatch(f"hl.dsp.focus({{workspace={lua_string(home_workspace)}}})")
+
+        # Placing a window into a special workspace by address pulls that
+        # workspace up, so a restored scratchpad app would otherwise leave the
+        # scratchpad hanging open over the desktop you just came back to.
+        for name in shown_specials() - specials_before:
+            short = name.split(":", 1)[-1]
+            if short:
+                dispatch(f"hl.dsp.workspace.toggle_special({lua_string(short)})")
+                log(f"restore: put the {short} scratchpad away again")
+
         log("restore: completed")
         lock.close()  # the kernel would drop it anyway if we died here
 

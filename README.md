@@ -63,6 +63,12 @@ altogether. Placing by address afterwards is what makes web apps land reliably.
 Omarchy also sets `misc:focus_on_activate = true`, so apps grab focus as they
 finish loading; the restore re-asserts your original workspace afterwards.
 
+**Scratchpad.** Apps in Omarchy's Meta+S scratchpad are restored to it. Special
+workspaces are recorded by name rather than by number, because their ids are
+negative and handed out in creation order, so they mean nothing across a
+reboot. Placing a window into a special workspace pulls that workspace up, so
+the restore puts it away again afterwards — unless you already had it open.
+
 ## Notes and limits
 
 - Snapshots are **periodic, not on shutdown**. That is deliberate: it also
@@ -73,6 +79,10 @@ finish loading; the restore re-asserts your original workspace afterwards.
 - Browsers are relaunched once via `omarchy-launch-browser` and restore their
   own windows and tabs.
 - A slow starter may flash briefly on the current workspace before it is moved.
+- Windows are matched to their saved entry by class, since a window carries no
+  trace of the exec that produced it. Where one class was launched more than
+  once, the entry wanting the workspace the window actually reached wins, and
+  launch order breaks any remaining tie.
 - What the restore did is logged to `~/.local/state/omarchy/session-restore.log`,
   since it runs unattended at login with no terminal to print to. Saves are
   logged only when the layout actually changed, so the log stays a record of

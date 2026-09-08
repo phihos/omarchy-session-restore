@@ -272,3 +272,64 @@ def test_skip_classes_reads_the_user_file(session, tmp_path, monkeypatch):
     assert "Spotify" in classes
     assert "signal" in classes
     assert "# a comment" not in classes
+
+
+# --- how a workspace is recorded ----------------------------------------------
+
+def test_workspace_target_uses_the_number_for_a_normal_workspace(session):
+    assert session.workspace_target({"id": 3, "name": "3"}) == "3"
+
+
+def test_workspace_target_uses_the_name_for_a_special_workspace(session):
+    """Special workspaces have negative, unstable ids, so they go by name.
+
+    This is what makes Omarchy's Meta+S scratchpad survive a restore.
+    """
+    assert session.workspace_target({"id": -98, "name": "special:scratchpad"}) == \
+        "special:scratchpad"
+
+
+def test_workspace_target_handles_an_unnamed_special_workspace(session):
+    assert session.workspace_target({"id": -99, "name": "special"}) == "special:special"
+
+
+def test_workspace_target_skips_a_window_with_no_workspace(session):
+    assert session.workspace_target({}) is None
+
+
+# --- matching a mapped window to the entry that asked for it ------------------
+
+def pending_entry(cls, workspace):
+    return {"class": cls, "workspace": workspace, "command": [cls]}
+
+
+def test_match_entry_picks_the_only_candidate(session):
+    pending = [pending_entry("foot", "3")]
+    assert session.match_entry(pending, "foot", "3") is pending[0]
+
+
+def test_match_entry_ignores_other_classes(session):
+    pending = [pending_entry("chromium", "1"), pending_entry("foot", "3")]
+    assert session.match_entry(pending, "foot", "3") is pending[1]
+
+
+def test_match_entry_returns_none_for_a_window_we_did_not_ask_for(session):
+    assert session.match_entry([pending_entry("foot", "3")], "spotify", "2") is None
+
+
+def test_match_entry_prefers_the_entry_whose_workspace_the_window_reached(session):
+    """Two terminals, one in the scratchpad: the exec rule usually landed each
+    one correctly, so believe it rather than claiming entries in launch order."""
+    scratch = pending_entry("foot", "special:scratchpad")
+    normal = pending_entry("foot", "3")
+    pending = [scratch, normal]
+    assert session.match_entry(pending, "foot", "3") is normal
+    assert session.match_entry(pending, "foot", "special:scratchpad") is scratch
+
+
+def test_match_entry_falls_back_to_launch_order_when_the_window_landed_wrong(session):
+    """A window that ignored its rule matches the oldest pending entry, which is
+    the earliest launched -- the behaviour this had before the tiebreak."""
+    first = pending_entry("foot", "3")
+    second = pending_entry("foot", "4")
+    assert session.match_entry([first, second], "foot", "9") is first
